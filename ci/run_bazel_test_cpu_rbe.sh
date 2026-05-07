@@ -92,8 +92,10 @@ else
     rbe_config=rbe_${os}_${arch}
 fi
 
+mkdir -p test-artifacts
 bazel $bazel_output_base $JAXCI_BAZEL_CPU_RBE_MODE \
     $BZLMOD_CONFIG \
+    --profile=test-artifacts/bazel_profile.json.gz \
     --build_runfile_links=false \
     --config=$rbe_config \
     --repo_env=HERMETIC_PYTHON_VERSION="$JAXCI_HERMETIC_PYTHON_VERSION" \
