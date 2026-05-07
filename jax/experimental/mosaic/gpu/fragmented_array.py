@@ -2114,6 +2114,11 @@ class FragmentedArray:
       return FragmentedArray(
           _registers=self.registers, _layout=self.layout, _is_signed=is_signed
       )
+
+    ptx_isa_version = 0
+    if min(utils.bitwidth(cur_dtype), utils.bitwidth(new_dtype)) <= 8:
+      ptx_isa_version = mgpu_lib._mosaic_gpu_ext._get_ptxas_isa_version()  # type: ignore
+
     any_reg = self.registers.flat[0]
     reg_type = any_reg.type
     is_vector_reg = isinstance(reg_type, ir.VectorType)
@@ -2260,11 +2265,7 @@ class FragmentedArray:
           assert 0 <= part < 4
 
           # `cvt` with `.s2f6x2` instruction type introduced in PTX ISA v9.1
-          if (
-              utils.get_arch().major >= 10
-              and mgpu_lib is not None
-              and mgpu_lib._mosaic_gpu_ext._get_ptxas_isa_version() >= 91  # pylint: disable=protected-access
-          ):
+          if utils.get_arch().major >= 10 and ptx_isa_version >= 91:
             int_reg = llvm.inline_asm(
                 i32,
                 [reg],
@@ -2483,62 +2484,157 @@ class FragmentedArray:
       tgt_int_ty = ir.IntegerType.get_signless(tgt_bitwidth)
       even_vector_len = vector_len + (vector_len % 2)
       new_registers = np.empty_like(self.registers)
-      def do_convert(pair_vec):
+      def do_convert(vec, convert_vec_len):
+        assert convert_vec_len.bit_count() == 1
         # Construct the PTX assembly out of ptx_instr.
         # The complication here is that some of the f4x2 instructions take or
         # return .b8 registers which are not supported by the NVPTX LLVM backend,
         # so we need to convert them to 16-bit at the boundaries.
         assert 4 <= src_bitwidth <= 32
         assert 4 <= tgt_bitwidth <= 16
-        tgt_pair_int_ty = ir.IntegerType.get_signless(tgt_bitwidth * 2)
-        tgt_ptx_pair_int_ty = ir.IntegerType.get_signless(max(16, tgt_bitwidth * 2))
-        tgt_ptx_constraint = "=r" if tgt_bitwidth == 16 else "=h"
-        src_ptx_constraint = ",r" if src_bitwidth >= 16 else ",h"
-        ptx_constraints = (
-          tgt_ptx_constraint + src_ptx_constraint * (1 + (src_bitwidth == 32))
-        )
+        src_vec_bitwidth = src_bitwidth * convert_vec_len
+        tgt_vec_bitwidth = tgt_bitwidth * convert_vec_len
+
+        def get_ptx_constraint(bitwidth):
+          if bitwidth <= 16:
+            return "h", 1
+          return "r", bitwidth // 32
+        src_ptx_constraint, src_regs = get_ptx_constraint(src_vec_bitwidth)
+        tgt_ptx_constraint, tgt_regs = get_ptx_constraint(tgt_vec_bitwidth)
+        ptx_constraints = [("=" + tgt_ptx_constraint)] * tgt_regs
+        ptx_constraints += [src_ptx_constraint] * src_regs
+        ptx_constraints = ",".join(ptx_constraints)
+
         ptx_lines = ["{"]
-        if tgt_bitwidth > 4:
-          ptx_tgt_arg = "$0"
-          process_ptx_result = lambda result: result
-        else:
-          ptx_lines.append(".reg .b8 result;")
-          ptx_tgt_arg = "result"
-          process_ptx_result = lambda result: arith.trunci(i8, result)
+        src_packing = 32 // src_bitwidth
         if src_bitwidth == 32:
-          get_ptx_operands = lambda pair_vec: [vector.extract(pair_vec, [], [i]) for i in range(2)]
-          ptx_src_args = "$2, $1"  # 32-bit operands are flipped.
-        elif src_bitwidth >= 8:
-          src_pair_int_ty = ir.IntegerType.get_signless(src_bitwidth * 2)
-          get_ptx_operands = lambda pair_vec: [utils.bitcast(pair_vec, src_pair_int_ty)]
-          ptx_src_args = "$1"
+          # No unpacking necessary.
+          get_ptx_operands = lambda vec: [
+            vector.extract(vec, [], [i]) for i in range(convert_vec_len)
+          ]
+          ptx_operands = [f"${tgt_regs + i + 1}, ${tgt_regs + i}"
+                          for i in range(0, convert_vec_len, 2)]
+        elif src_bitwidth == 16:
+          get_ptx_operands = lambda vec: [
+            utils.bitcast(utils.vector_slice(vec, slice(i, i + 2)), i32)
+            for i in range(0, convert_vec_len, 2)
+          ]
+          ptx_operands = [f"${tgt_regs + i}" for i in range(convert_vec_len // 2)]
+        elif convert_vec_len == 2:  # Single narrow pair
+          if src_bitwidth == 8:
+            get_ptx_operands = lambda vec: [utils.bitcast(vec, i16)]
+            ptx_operands = ["$1"]
+          else:  # NVPTX inline_asm has no support for 8-bit registers...
+            assert src_bitwidth == 4
+            ptx_lines.append(".reg .b8 source_pair;")
+            ptx_lines.append("mov.b16 {source_pair, _}, $1;")
+            get_ptx_operands = lambda vec: [arith.extui(i16, utils.bitcast(vec, i8))]
+            ptx_operands = ["source_pair"]
+        else:  # Multiple narrow pairs
+          assert 4 <= src_bitwidth <= 8
+          assert convert_vec_len > 2
+          ptx_operands = [f"source_pair{i}" for i in range(convert_vec_len // 2)]
+          ptx_lines.append(
+            f".reg .b{src_bitwidth * 2} source_pair<{convert_vec_len // 2}>;")
+          # 4xf4 is still less than 32 bits...
+          pairs_per_src_reg = min(32, src_vec_bitwidth) // (src_bitwidth * 2)
+          for i in range(src_regs):
+            source_pairs = ", ".join(f"source_pair{i * pairs_per_src_reg + j}"
+                                     for j in range(pairs_per_src_reg))
+            ptx_lines.append(
+              f"mov.b{min(32, src_vec_bitwidth)} {{ {source_pairs} }}, ${tgt_regs + i};"
+            )
+          if src_vec_bitwidth < 32:
+            assert src_vec_bitwidth == 16
+            get_ptx_operands = lambda vec: [utils.bitcast(vec, i16)]
+          else:
+            get_ptx_operands = lambda vec: [
+              utils.bitcast(utils.vector_slice(vec, slice(i, i + src_packing)), i32)
+              for i in range(0, convert_vec_len, src_packing)
+            ]
+
+        ptx_lines.append(
+          f".reg .b{tgt_bitwidth * 2} result_pair<{convert_vec_len // 2}>;"
+        )
+        ptx_targets = [f"result_pair{i}" for i in range(convert_vec_len // 2)]
+        for tgt, op in zip(ptx_targets, ptx_operands, strict=True):
+          ptx_lines.append(f"{ptx_instr} {tgt}, {op};")
+
+        tgt_packing = 32 // tgt_bitwidth
+        if tgt_vec_bitwidth > 32:
+          ptx_result_ty = llvm.StructType.get_literal(
+            [i32] * (convert_vec_len // tgt_packing)
+          )
+          def process_ptx_result(ptx_result):
+            vec_32 = ir.VectorType.get((tgt_packing,), tgt_int_ty)
+            elements = [
+                utils.bitcast(llvm.extractvalue(i32, ptx_result, [i]), vec_32)
+                for i in range(convert_vec_len // tgt_packing)
+            ]
+            return utils.vector_concat(elements)
+          assert tgt_packing >= 2
+          ptx_targets_per_out = tgt_packing // 2
+          for out_vec_idx in range(convert_vec_len // tgt_packing):
+            out_targets = ptx_targets[
+              out_vec_idx * ptx_targets_per_out:(out_vec_idx + 1) * ptx_targets_per_out
+            ]
+            if len(out_targets) == 1:
+              [mov_src] = out_targets
+            else:
+              mov_src = f"{{ {', '.join(out_targets) } }}"
+            ptx_lines.append(f"mov.b32 ${out_vec_idx}, {mov_src};")
+        elif tgt_vec_bitwidth >= 16:
+          ptx_result_ty = ir.IntegerType.get_signless(tgt_vec_bitwidth)
+          def process_ptx_result(ptx_result):
+            return utils.bitcast(
+              ptx_result, ir.VectorType.get((convert_vec_len,), tgt_int_ty)
+            )
+          if len(ptx_targets) == 1:
+            [mov_src] = ptx_targets
+          else:
+            mov_src = f"{{ {', '.join(ptx_targets) } }}"
+          ptx_lines.append(f"mov.b{tgt_vec_bitwidth} $0, {mov_src};")
+        elif tgt_vec_bitwidth == 8:  # NVPTX inline_asm has no support for 8-bit registers...
+          ptx_result_ty = i16
+          def process_ptx_result(ptx_result):
+            ptx_result = arith.trunci(i8, ptx_result)
+            return utils.bitcast(
+              ptx_result, ir.VectorType.get((convert_vec_len,), tgt_int_ty)
+            )
+          [ptx_target] = ptx_targets
+          ptx_lines.append(f"mov.b16 $0, {{ {ptx_target}, {ptx_target} }};")
         else:
-          assert src_bitwidth == 4
-          ptx_lines.append(".reg .b8 source;")
-          ptx_lines.append("mov.b16 {source, _}, $1;")
-          ptx_src_args = "source"
-          get_ptx_operands = lambda pair_vec: [arith.extui(i16, utils.bitcast(pair_vec, i8))]
-        ptx_lines.append(f"  {ptx_instr} {ptx_tgt_arg}, {ptx_src_args};")
-        if tgt_bitwidth == 4:
-          ptx_lines.append("mov.b16 $0, {result, result};")
+          raise AssertionError("tgt_bitwidth too small")
+
         ptx_lines.append("}")
         ptx = "\t" + "\n\t".join(ptx_lines)
         ptx_result = llvm.inline_asm(
-            tgt_ptx_pair_int_ty, get_ptx_operands(pair_vec), ptx, ptx_constraints
+            ptx_result_ty, get_ptx_operands(vec), ptx, ptx_constraints
         )
-        ptx_result = process_ptx_result(ptx_result)
-        assert ptx_result.type == tgt_pair_int_ty
-        return utils.bitcast(ptx_result, ir.VectorType.get((2,), tgt_int_ty))
+        result = process_ptx_result(ptx_result)
+        assert result.type == ir.VectorType.get((convert_vec_len,), tgt_int_ty)
+        return result
+      longest_useful_vector = 32 // min(src_bitwidth, tgt_bitwidth)
+      # We query the ptxas isa version as a proxy for PTX version. Old ptxas
+      # binaries miscompile some of the patterns we generate here.
       for idx, reg in np.ndenumerate(self.registers):
         reg = utils.bitcast(reg, ir.VectorType.get((vector_len,), src_int_ty))
         if vector_len % 2:
           reg = utils.vector_concat([reg, llvm.mlir_undef(ir.VectorType.get((1,), src_int_ty))])
+        convert_vec_len = longest_useful_vector
+        base_idx = 0
         result_vecs = []
-        for base_idx in range(0, even_vector_len, 2):
-          pair_vec = utils.vector_slice(reg, slice(base_idx, base_idx + 2))
-          new_pair_vec = do_convert(pair_vec)
-          assert new_pair_vec.type == ir.VectorType.get((2,), tgt_int_ty)
-          result_vecs.append(new_pair_vec)
+        while convert_vec_len >= 2:
+          if cur_dtype == f4e2m1fn and convert_vec_len == 4 and ptx_isa_version < 90:
+            convert_vec_len //= 2  # ptxas miscompiles 4xfp4 on CUDA 12.8...
+            continue
+          while (next_base_idx := base_idx + convert_vec_len) <= even_vector_len:
+            vec = utils.vector_slice(reg, slice(base_idx, next_base_idx))
+            new_vec = do_convert(vec, convert_vec_len)
+            assert new_vec.type == ir.VectorType.get((convert_vec_len,), tgt_int_ty)
+            result_vecs.append(new_vec)
+            base_idx = next_base_idx
+          convert_vec_len //= 2
         new_reg = utils.vector_concat(result_vecs)
         if vector_len % 2:
           new_reg = utils.vector_slice(new_reg, slice(0, vector_len))
@@ -2549,9 +2645,14 @@ class FragmentedArray:
 
     # Here we handle all conversions involving f8 types.
     # TODO(apaszke): Figure out proper satfinite control.
-    supported_f8_f16: dict[ir.Type, ir.Type] = {
-        f8e4m3fn: f16, f8e5m2: f16, f8e8m0fnu: bf16
+    supported_f8_f16: dict[ir.Type, tuple[ir.Type, ...]] = {
+        f8e4m3fn: (f16,), f8e5m2: (f16,), f8e8m0fnu: (bf16,)
     }
+    if ptx_isa_version >= 92:
+      # Technically those downcasts are already supported in 91, but the casts
+      # only become symmetric in 92 so that's what we use as the cutoff.
+      supported_f8_f16[f8e4m3fn] += (bf16,)
+      supported_f8_f16[f8e5m2] += (bf16,)
     f8_ptx_names: dict[ir.Type, str] = {
         f8e4m3fn: "e4m3", f8e5m2: "e5m2", f8e8m0fnu: "ue8m0"
     }
@@ -2594,14 +2695,15 @@ class FragmentedArray:
       return pairwise_convert(f"cvt.{ptx_round}.satfinite.{name_8}x2.f32")
     # No f8 type supports direct conversion to f32, so we go via 16-bit floats.
     if cur_dtype in f8_types and new_dtype == f32:
-      return self.astype(supported_f8_f16[cur_dtype]).astype(f32)
+      # We can pick any of the supported f16 types.
+      return self.astype(supported_f8_f16[cur_dtype][0]).astype(f32)
     # f8 <-> f16
-    if new_dtype in f8_types and cur_dtype == supported_f8_f16[new_dtype]:
+    if new_dtype in f8_types and cur_dtype in supported_f8_f16[new_dtype]:
       name_16 = f16_ptx_names[cur_dtype]
       name_8 = f8_ptx_names[new_dtype]
       ptx_round = get_fp8_rounding(new_dtype)
       return pairwise_convert(f"cvt.{ptx_round}.satfinite.{name_8}x2.{name_16}x2")
-    if cur_dtype in f8_types and new_dtype == supported_f8_f16[cur_dtype]:
+    if cur_dtype in f8_types and new_dtype in supported_f8_f16[cur_dtype]:
       name_8 = f8_ptx_names[cur_dtype]
       name_16 = f16_ptx_names[new_dtype]
       return pairwise_convert(f"cvt.rn.{name_16}x2.{name_8}x2")
@@ -2611,18 +2713,30 @@ class FragmentedArray:
         new_dtype in f16_types and cur_dtype in f8_types
     ):
       # Remap the 16-bit type to the supported one.
-      ok_cur_dtype = supported_f8_f16.get(new_dtype, cur_dtype)
-      ok_new_dtype = supported_f8_f16.get(cur_dtype, new_dtype)
+      supported_16 = supported_f8_f16[cur_dtype if cur_dtype in f8_types else new_dtype]
+      ok_new_dtype = " or ".join(map(str, supported_16))
+      ptx_hint = ""
+      if ptx_isa_version < 92 and f8e8m0fnu not in {cur_dtype, new_dtype}:
+        ptx_hint = (
+            " This conversion would be supported if a newer CUDA (ptxas)"
+            " version was available."
+        )
       raise NotImplementedError(
           f"Hardware has no support for converting from {cur_dtype} to"
-          f" {new_dtype} (only cast from {ok_cur_dtype} to {ok_new_dtype} is"
+          f" {new_dtype} (only cast from {cur_dtype} to {ok_new_dtype} is"
           " supported). Cast to f32 first and then to the target type"
-          " (expensive, but sufficient)."
+          " (expensive, but sufficient)." + ptx_hint
       )
     # Repack through a shared 16-bit type.
     if cur_dtype in f8_types and new_dtype in f8_types:
-      if supported_f8_f16[cur_dtype] == supported_f8_f16[new_dtype]:
-        return self.astype(supported_f8_f16[cur_dtype]).astype(new_dtype)
+      # We don't use set intersection to avoid introducing non-determinism.
+      common_f16 = next(
+          (e for e in supported_f8_f16[cur_dtype]
+          if e in supported_f8_f16[new_dtype]),
+          None
+      )
+      if common_f16 is not None:
+        return self.astype(common_f16).astype(new_dtype)
       raise NotImplementedError(
           f"Conversion from {cur_dtype} to {new_dtype} must go through f32,"
           " which is expensive. Cast to f32 explicitly if you really want it."
@@ -2633,34 +2747,23 @@ class FragmentedArray:
           "f4e2m1fn casts only supported on Blackwell and newer GPUs"
       )
     if cur_dtype == f4e2m1fn and new_dtype in {bf16, f16}:
-      if (
-          new_dtype == bf16
-          and mgpu_lib is not None
-          and mgpu_lib._mosaic_gpu_ext._get_ptxas_isa_version() < 92  # pylint: disable=protected-access
-      ):
+      if new_dtype == bf16 and ptx_isa_version < 92:
         return self.astype(f32).astype(bf16)
       return pairwise_convert(f"cvt.rn.{f16_ptx_names[new_dtype]}x2.e2m1x2")
     if (cur_dtype == f4e2m1fn and new_dtype in f8_ptx_names) or (
         new_dtype == f4e2m1fn and cur_dtype in f8_ptx_names
     ):
       f8_type = new_dtype if cur_dtype == f4e2m1fn else cur_dtype
-      if supported_f8_f16[f8_type] == f16:
+      if f16 in supported_f8_f16[f8_type]:
         return self.astype(f16).astype(new_dtype)
-      if (
-          mgpu_lib is not None
-          and mgpu_lib._mosaic_gpu_ext._get_ptxas_isa_version() >= 92  # pylint: disable=protected-access
-      ):
-        assert supported_f8_f16[f8_type] == bf16
+      if ptx_isa_version >= 92:
+        assert bf16 in supported_f8_f16[f8_type]
         return self.astype(bf16).astype(new_dtype)
-      else:
-        return self.astype(f32).astype(new_dtype)
+      return self.astype(f32).astype(new_dtype)
     if cur_dtype == f4e2m1fn and new_dtype == f32:
       return self.astype(f16).astype(f32)
     if new_dtype == f4e2m1fn and cur_dtype in {bf16, f16}:
-      if (
-          mgpu_lib is not None
-          and mgpu_lib._mosaic_gpu_ext._get_ptxas_isa_version() >= 91  # pylint: disable=protected-access
-      ):
+      if ptx_isa_version >= 91:
         return pairwise_convert(f"cvt.rn.satfinite.e2m1x2.{f16_ptx_names[cur_dtype]}x2")
       else:
         return self.astype(f32).astype(f4e2m1fn)
