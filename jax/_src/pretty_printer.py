@@ -150,9 +150,17 @@ def nil() -> Doc:
   return _pretty_printer.nil()  # pyrefly: ignore[bad-return]
 
 
-def text(text: str, annotation: str | None = None) -> Doc:
+def text(
+    text: str,
+    annotation: str | None = None,
+    anchor: str | None = None,
+    href: str | None = None,
+) -> Doc:
   """Literal text."""
-  return _pretty_printer.text(text, annotation)  # pyrefly: ignore[bad-return]
+  if jaxlib_extension_version >= 451:
+    return _pretty_printer.text(text, annotation, anchor, href)  # pyrefly: ignore[bad-return]
+  else:
+    return _pretty_printer.text(text, annotation)  # pyrefly: ignore[bad-return]
 
 
 def concat(children: Sequence[Doc]) -> Doc:
