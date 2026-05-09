@@ -107,23 +107,53 @@ compute_on_p.def_abstract_eval(_compute_on_abstract_eval)
 
 
 def _compute_on_lowering(ctx, *args, jaxpr, compute_type, out_memory_spaces):
+  from jax._src.layout import Layout
   const_args_and_avals = core.jaxpr_const_args(jaxpr.jaxpr)
   const_args, const_avals = unzip2(const_args_and_avals)
   const_arg_values = [
       mlir.ir_constants(c, const_lowering=ctx.const_lowering, aval=aval)
       for c, aval in const_args_and_avals]
   in_avals = (*const_avals, *ctx.avals_in)
-  func_op, output_types, effects = mlir.lower_called_computation(
-      "compute_on", jaxpr, ctx.module_context, len(const_args), in_avals,
-      ctx.avals_out, ctx.tokens_in)
+
+  # Pin the host-call boundary to default layouts on both sides. XLA's
+  # layout assignment runs separately on the caller and the called function;
+  # for the kHostCompute lowering of compute_on, the async-start strictly
+  # requires matching layouts. Without this pin XLA tends to pick scan-
+  # friendly layouts on the caller side but default ones on the callee
+  # side, and the boundary check fails.
+  def _default_layout(aval):
+    if not hasattr(aval, "ndim") or aval.ndim == 0:
+      return None
+    return Layout(tuple(range(aval.ndim)))
+
+  arg_layouts = [_default_layout(a) for a in in_avals]
+  result_layouts = [_default_layout(a) for a in ctx.avals_out]
+
+  effects = list(ctx.tokens_in.effects())
+  output_types = [mlir._aval_to_ir_types(ctx.module_context, a) for a in ctx.avals_out]
+  output_types = [mlir.token_type()] * len(effects) + output_types
+  func_op = mlir.lower_jaxpr_to_fun(
+      ctx.module_context, "compute_on", jaxpr, effects,
+      num_const_args=len(const_args), in_avals=in_avals,
+      arg_layouts=arg_layouts, result_layouts=result_layouts)
 
   symbol_name = func_op.name.value
   flat_output_types = mlir.flatten_ir_types(output_types)
   tokens = [ctx.tokens_in.get(eff) for eff in effects]
-  args = (*ctx.dim_var_values, *tokens, *const_arg_values, *args)
+
+  def _wrap_default(val, aval):
+    layout = _default_layout(aval)
+    if layout is None:
+      return val
+    return mlir.wrap_with_layout_op(ctx, val, aval, layout, aval)
+
+  pinned_const_args = [_wrap_default(v, a)
+                       for v, a in zip(const_arg_values, const_avals)]
+  pinned_args = [_wrap_default(v, a) for v, a in zip(args, ctx.avals_in)]
+  call_args = (*ctx.dim_var_values, *tokens, *pinned_const_args, *pinned_args)
   call = func_dialect.CallOp(
       flat_output_types, ir.FlatSymbolRefAttr.get(symbol_name),
-      mlir.flatten_ir_values(args))
+      mlir.flatten_ir_values(call_args))
 
   if compute_type.startswith("gpu_stream:"):
     dict_attr = ir.DictAttr.get({
@@ -140,9 +170,10 @@ def _compute_on_lowering(ctx, *args, jaxpr, compute_type, out_memory_spaces):
   tokens, out_nodes = split_list(out_nodes, [len(effects)])
   tokens_out = ctx.tokens_in.update_tokens(mlir.TokenSet(zip(effects, tokens)))
   ctx.set_tokens_out(tokens_out)
+  pinned_outs = [_wrap_default(on, a) for on, a in zip(out_nodes, ctx.avals_out)]
   return [
       mlir.wrap_with_memory_kind(ctx.module_context, on, core.mem_space_to_kind(oms), out_aval)  # pyrefly: ignore[bad-argument-type]
-      for on, out_aval, oms in zip(out_nodes, ctx.avals_out, out_memory_spaces)
+      for on, out_aval, oms in zip(pinned_outs, ctx.avals_out, out_memory_spaces)
   ]
 
 mlir.register_lowering(compute_on_p, _compute_on_lowering)
